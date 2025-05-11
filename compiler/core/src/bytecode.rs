@@ -103,8 +103,8 @@ impl ConstantBag for BasicBag {
 /// a code object. Also a module has a code object.
 #[derive(Clone)]
 pub struct CodeObject<C: Constant = ConstantData> {
-    pub instructions: Box<[CodeUnit]>,
-    pub locations: Box<[SourceLocation]>,
+    pub instructions: Vec<CodeUnit>,
+    pub locations: Vec<SourceLocation>,
     pub flags: CodeFlags,
     pub posonlyarg_count: u32,
     // Number of positional-only arguments
@@ -115,12 +115,12 @@ pub struct CodeObject<C: Constant = ConstantData> {
     pub max_stackdepth: u32,
     pub obj_name: C::Name,
     // Name of the object that created this code object
-    pub cell2arg: Option<Box<[i32]>>,
-    pub constants: Box<[C]>,
-    pub names: Box<[C::Name]>,
-    pub varnames: Box<[C::Name]>,
-    pub cellvars: Box<[C::Name]>,
-    pub freevars: Box<[C::Name]>,
+    pub cell2arg: Option<Vec<i32>>,
+    pub constants: Vec<C>,
+    pub names: Vec<C::Name>,
+    pub varnames: Vec<C::Name>,
+    pub cellvars: Vec<C::Name>,
+    pub freevars: Vec<C::Name>,
 }
 
 bitflags! {
@@ -650,7 +650,7 @@ impl TryFrom<u8> for Instruction {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct CodeUnit {
     pub op: Instruction,
@@ -773,9 +773,16 @@ pub enum BorrowedConstant<'a, C: Constant> {
 }
 
 impl<C: Constant> Copy for BorrowedConstant<'_, C> {}
+
 impl<C: Constant> Clone for BorrowedConstant<'_, C> {
     fn clone(&self) -> Self {
         *self
+    }
+}
+
+impl<C: Constant> fmt::Debug for BorrowedConstant<'_, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        self.fmt_display(f)
     }
 }
 
@@ -1071,17 +1078,15 @@ impl<C: Constant> CodeObject<C> {
 
     /// Map this CodeObject to one that holds a Bag::Constant
     pub fn map_bag<Bag: ConstantBag>(self, bag: Bag) -> CodeObject<Bag::Constant> {
-        let map_names = |names: Box<[C::Name]>| {
+        let map_names = |names: Vec<C::Name>| {
             names
-                .into_vec()
                 .into_iter()
                 .map(|x| bag.make_name(x.as_ref()))
-                .collect::<Box<[_]>>()
+                .collect::<Vec<_>>()
         };
         CodeObject {
             constants: self
                 .constants
-                .into_vec()
                 .into_iter()
                 .map(|x| bag.make_constant(x.borrow_constant()))
                 .collect(),

@@ -1,5 +1,6 @@
 mod instructions;
 
+use crate::instructions::FunctionTranspiler;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleError};
@@ -41,8 +42,7 @@ struct Jit {
 
 impl Jit {
     fn new() -> Self {
-        let builder = JITBuilder::new(cranelift_module::default_libcall_names())
-            .expect("Failed to build JITBuilder");
+        let builder = JITBuilder::new(cranelift_module::default_libcall_names()).expect("Failed to build JITBuilder");
         let module = JITModule::new(builder);
         Self {
             builder_context: FunctionBuilderContext::new(),
@@ -58,26 +58,16 @@ impl Jit {
         ret: Option<JitType>,
     ) -> Result<(FuncId, JitSig), JitCompileError> {
         for arg in args {
-            self.ctx
-                .func
-                .signature
-                .params
-                .push(AbiParam::new(arg.to_cranelift()));
+            self.ctx.func.signature.params.push(AbiParam::new(arg.to_cranelift()));
         }
 
         if ret.is_some() {
-            self.ctx
-                .func
-                .signature
-                .returns
-                .push(AbiParam::new(ret.clone().unwrap().to_cranelift()));
+            self.ctx.func.signature.returns.push(AbiParam::new(ret.clone().unwrap().to_cranelift()));
         }
 
-        let id = self.module.declare_function(
-            &format!("jit_{}", bytecode.obj_name.as_ref()),
-            Linkage::Export,
-            &self.ctx.func.signature,
-        )?;
+        let id = self
+            .module
+            .declare_function(&format!("jit_{}", bytecode.obj_name.as_ref()), Linkage::Export, &self.ctx.func.signature)?;
 
         let func_ref = self.module.declare_func_in_func(id, &mut self.ctx.func);
 
@@ -86,14 +76,12 @@ impl Jit {
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
 
+        let mut transpiler = FunctionTranspiler::new(bytecode);
+        transpiler.transpile();
+        transpiler.print();
+
         let sig = {
-            let mut compiler = FunctionCompiler::new(
-                &mut builder,
-                bytecode.varnames.len(),
-                args,
-                ret,
-                entry_block,
-            );
+            let mut compiler = FunctionCompiler::new(&mut builder, bytecode.varnames.len(), args, ret, entry_block);
 
             compiler.compile(func_ref, bytecode)?;
 
@@ -160,10 +148,7 @@ impl CompiledCode {
     unsafe fn invoke_raw(&self, cif_args: &[libffi::middle::Arg]) -> Option<AbiValue> {
         unsafe {
             let cif = self.sig.to_cif();
-            let value = cif.call::<UnTypedAbiValue>(
-                libffi::middle::CodePtr::from_ptr(self.code as *const _),
-                cif_args,
-            );
+            let value = cif.call::<UnTypedAbiValue>(libffi::middle::CodePtr::from_ptr(self.code as *const _), cif_args);
             self.sig.ret.as_ref().map(|ty| value.to_typed(ty))
         }
     }
@@ -281,9 +266,7 @@ impl TryFrom<AbiValue> for bool {
 
 fn type_check(ty: &JitType, val: &AbiValue) -> Result<(), JitArgumentError> {
     match (ty, val) {
-        (JitType::Int, AbiValue::Int(_))
-        | (JitType::Float, AbiValue::Float(_))
-        | (JitType::Bool, AbiValue::Bool(_)) => Ok(()),
+        (JitType::Int, AbiValue::Int(_)) | (JitType::Float, AbiValue::Float(_)) | (JitType::Bool, AbiValue::Bool(_)) => Ok(()),
         _ => Err(JitArgumentError::ArgumentTypeMismatch),
     }
 }

@@ -10,7 +10,7 @@ repository.workspace = true
 license.workspace = true
 
 [features]
-default = ["compiler", "wasmbind", "stdio"]
+default = ["compiler", "wasmbind", "stdio", "jit"]
 stdio = []
 importlib = []
 encodings = ["importlib"]

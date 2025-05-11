@@ -183,7 +183,7 @@ pub fn deserialize_code<R: Read, Bag: ConstantBag>(
             let arg = OpArgByte(cu[1]);
             Ok(CodeUnit { op, arg })
         })
-        .collect::<Result<Box<[CodeUnit]>>>()?;
+        .collect::<Result<_>>()?;
 
     let len = rdr.read_u32()?;
     let locations = (0..len)
@@ -193,7 +193,7 @@ pub fn deserialize_code<R: Read, Bag: ConstantBag>(
                 column: OneIndexed::from_zero_indexed(rdr.read_u32()? as _),
             })
         })
-        .collect::<Result<Box<[SourceLocation]>>>()?;
+        .collect::<Result<_>>()?;
 
     let flags = CodeFlags::from_bits_truncate(rdr.read_u16()?);
 
@@ -215,14 +215,14 @@ pub fn deserialize_code<R: Read, Bag: ConstantBag>(
         .then(|| {
             (0..len)
                 .map(|_| Ok(rdr.read_u32()? as i32))
-                .collect::<Result<Box<[i32]>>>()
+                .collect::<Result<_>>()
         })
         .transpose()?;
 
     let len = rdr.read_u32()?;
     let constants = (0..len)
         .map(|_| deserialize_value(rdr, bag))
-        .collect::<Result<Box<[_]>>>()?;
+        .collect::<Result<_>>()?;
 
     let mut read_names = || {
         let len = rdr.read_u32()?;
@@ -231,7 +231,7 @@ pub fn deserialize_code<R: Read, Bag: ConstantBag>(
                 let len = rdr.read_u32()?;
                 Ok(bag.make_name(rdr.read_str(len)?))
             })
-            .collect::<Result<Box<[_]>>>()
+            .collect::<Result<_>>()
     };
 
     let names = read_names()?;

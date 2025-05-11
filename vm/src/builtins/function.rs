@@ -23,6 +23,7 @@ use crate::{
     },
 };
 use itertools::Itertools;
+use rustpython_compiler_core::bytecode::Constant;
 #[cfg(feature = "jit")]
 use rustpython_jit::CompiledCode;
 
@@ -505,9 +506,28 @@ impl PyFunction {
     fn jit(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<()> {
         zelf.jitted_code
             .get_or_try_init(|| {
+                let bytecode = &zelf.code.code;
                 let arg_types = jitfunc::get_jit_arg_types(&zelf, vm)?;
                 let ret_type = jitfunc::jit_ret_type(&zelf, vm)?;
-                rustpython_jit::compile(&zelf.code.code, &arg_types, ret_type)
+
+                log::trace!(
+                    "varnames:{:?}",
+                    bytecode
+                        .varnames
+                        .iter()
+                        .map(|x| x.as_str())
+                        .collect::<Vec<&str>>()
+                );
+                log::trace!(
+                    "constants:{:?}",
+                    bytecode
+                        .constants
+                        .iter()
+                        .map(|x| format!("{:?}", x.borrow_constant()))
+                        .collect::<Vec<String>>()
+                );
+
+                rustpython_jit::compile(bytecode, &arg_types, ret_type)
                     .map_err(|err| jitfunc::new_jit_error(err.to_string(), vm))
             })
             .map(drop)

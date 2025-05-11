@@ -1,15 +1,15 @@
 use rustpython_jit::{AbiValue, JitArgumentError};
 
 // TODO currently broken
-// #[test]
-// fn test_no_return_value() {
-//     let func = jit_function! { func() => r##"
-//         def func():
-//             pass
-//     "## };
-//
-//     assert_eq!(func(), Ok(()));
-// }
+#[test]
+fn test_no_return_value() {
+    let func = jit_function! { func() => r##"
+        def func():
+            pass
+    "## };
+
+    assert_eq!(func(), Ok(()));
+}
 
 #[test]
 fn test_invoke() {

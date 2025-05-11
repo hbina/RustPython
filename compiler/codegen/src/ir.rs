@@ -165,8 +165,8 @@ impl CodeInfo {
             obj_name,
 
             max_stackdepth,
-            instructions: instructions.into_boxed_slice(),
-            locations: locations.into_boxed_slice(),
+            instructions,
+            locations,
             constants: constants.into_iter().collect(),
             names: name_cache.into_iter().collect(),
             varnames: varname_cache.into_iter().collect(),
@@ -176,7 +176,7 @@ impl CodeInfo {
         })
     }
 
-    fn cell2arg(&self) -> Option<Box<[i32]>> {
+    fn cell2arg(&self) -> Option<Vec<i32>> {
         if self.cellvar_cache.is_empty() {
             return None;
         }
@@ -200,7 +200,7 @@ impl CodeInfo {
                         i as i32
                     })
             })
-            .collect::<Box<[_]>>();
+            .collect::<Vec<_>>();
 
         if found_cellarg { Some(cell2arg) } else { None }
     }

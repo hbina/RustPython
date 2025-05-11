@@ -4,10 +4,11 @@ use cranelift::codegen::ir::FuncRef;
 use cranelift::prelude::*;
 use num_traits::cast::ToPrimitive;
 use rustpython_compiler_core::bytecode::{
-    self, BinaryOperator, BorrowedConstant, CodeObject, ComparisonOperator, Instruction, Label,
-    OpArg, OpArgState, UnaryOperator,
+    self, Arg, BinaryOperator, BorrowedConstant, CodeObject, ComparisonOperator, Constant, ConstantData, Instruction, Label, OpArg, OpArgState,
+    UnaryOperator,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::{Debug, Formatter};
 
 #[repr(u16)]
 enum CustomTrapCode {
@@ -66,7 +67,7 @@ struct DDValue {
 pub struct FunctionCompiler<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     stack: Vec<JitValue>,
-    variables: Box<[Option<Local>]>,
+    variables: Vec<Option<Local>>,
     label_to_block: HashMap<Label, Block>,
     pub(crate) sig: JitSig,
 }
@@ -82,7 +83,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let mut compiler = FunctionCompiler {
             builder,
             stack: Vec::new(),
-            variables: vec![None; num_variables].into_boxed_slice(),
+            variables: vec![None; num_variables],
             label_to_block: HashMap::new(),
             sig: JitSig {
                 args: arg_types.to_vec(),
@@ -91,9 +92,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         };
         let params = compiler.builder.func.dfg.block_params(entry_block).to_vec();
         for (i, (ty, val)) in arg_types.iter().zip(params).enumerate() {
-            compiler
-                .store_variable(i as u32, JitValue::from_type_and_value(ty.clone(), val))
-                .unwrap();
+            compiler.store_variable(i as u32, JitValue::from_type_and_value(ty.clone(), val)).unwrap();
         }
         compiler
     }
@@ -103,19 +102,12 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         self.stack.drain(stack_len - count..).collect()
     }
 
-    fn store_variable(
-        &mut self,
-        idx: bytecode::NameIdx,
-        val: JitValue,
-    ) -> Result<(), JitCompileError> {
+    fn store_variable(&mut self, idx: bytecode::NameIdx, val: JitValue) -> Result<(), JitCompileError> {
         let builder = &mut self.builder;
         let ty = val.to_jit_type().ok_or(JitCompileError::NotSupported)?;
         let local = self.variables[idx as usize].get_or_insert_with(|| {
             let var = Variable::new(idx as usize);
-            let local = Local {
-                var,
-                ty: ty.clone(),
-            };
+            let local = Local { var, ty: ty.clone() };
             builder.declare_var(var, ty.to_cranelift());
             local
         });
@@ -147,22 +139,18 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
 
     fn get_or_create_block(&mut self, label: Label) -> Block {
         let builder = &mut self.builder;
-        *self
-            .label_to_block
-            .entry(label)
-            .or_insert_with(|| builder.create_block())
+        *self.label_to_block.entry(label).or_insert_with(|| builder.create_block())
     }
 
-    pub fn compile<C: bytecode::Constant>(
-        &mut self,
-        func_ref: FuncRef,
-        bytecode: &CodeObject<C>,
-    ) -> Result<(), JitCompileError> {
+    pub fn compile<C: bytecode::Constant>(&mut self, func_ref: FuncRef, bytecode: &CodeObject<C>) -> Result<(), JitCompileError> {
         let label_targets = bytecode.label_targets();
         let mut arg_state = OpArgState::default();
 
         // Track whether we have "returned" in the current block
         let mut in_unreachable_code = false;
+        for (offset, inst) in bytecode.instructions.iter().enumerate() {
+            println!("{} => {:?} => {:?}", offset, inst.op, inst.arg);
+        }
 
         for (offset, &raw_instr) in bytecode.instructions.iter().enumerate() {
             let label = Label(offset as u32);
@@ -215,16 +203,13 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         Ok(())
     }
 
-    fn prepare_const<C: bytecode::Constant>(
-        &mut self,
-        constant: BorrowedConstant<'_, C>,
-    ) -> Result<JitValue, JitCompileError> {
+    fn prepare_const<C: bytecode::Constant>(&mut self, constant: BorrowedConstant<'_, C>) -> Result<JitValue, JitCompileError> {
         let value = match constant {
             BorrowedConstant::Integer { value } => {
-                let val = self.builder.ins().iconst(
-                    types::I64,
-                    value.to_i64().ok_or(JitCompileError::NotSupported)?,
-                );
+                let val = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, value.to_i64().ok_or(JitCompileError::NotSupported)?);
                 JitValue::Int(val)
             }
             BorrowedConstant::Float { value } => {
@@ -251,11 +236,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
             // First time we see a return, define it in the signature
             let ty = val.to_jit_type().ok_or(JitCompileError::NotSupported)?;
             self.sig.ret = Some(ty.clone());
-            self.builder
-                .func
-                .signature
-                .returns
-                .push(AbiParam::new(ty.to_cranelift()));
+            self.builder.func.signature.returns.push(AbiParam::new(ty.to_cranelift()));
         }
 
         // If this is e.g. an Int, Float, or Bool we have a Cranelift `Value`.
@@ -281,9 +262,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 let then_block = self.get_or_create_block(target.get(arg));
                 let else_block = self.builder.create_block();
 
-                self.builder
-                    .ins()
-                    .brif(val, else_block, &[], then_block, &[]);
+                self.builder.ins().brif(val, else_block, &[], then_block, &[]);
                 self.builder.switch_to_block(else_block);
 
                 Ok(())
@@ -294,9 +273,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 let then_block = self.get_or_create_block(target.get(arg));
                 let else_block = self.builder.create_block();
 
-                self.builder
-                    .ins()
-                    .brif(val, then_block, &[], else_block, &[]);
+                self.builder.ins().brif(val, then_block, &[], else_block, &[]);
                 self.builder.switch_to_block(else_block);
 
                 Ok(())
@@ -308,13 +285,9 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 Ok(())
             }
             Instruction::LoadFast(idx) => {
-                let local = self.variables[idx.get(arg) as usize]
-                    .as_ref()
-                    .ok_or(JitCompileError::BadBytecode)?;
-                self.stack.push(JitValue::from_type_and_value(
-                    local.ty.clone(),
-                    self.builder.use_var(local.var),
-                ));
+                let local = self.variables[idx.get(arg) as usize].as_ref().ok_or(JitCompileError::BadBytecode)?;
+                self.stack
+                    .push(JitValue::from_type_and_value(local.ty.clone(), self.builder.use_var(local.var)));
                 Ok(())
             }
             Instruction::StoreFast(idx) => {
@@ -322,8 +295,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 self.store_variable(idx.get(arg), val)
             }
             Instruction::LoadConst { idx } => {
-                let val = self
-                    .prepare_const(bytecode.constants[idx.get(arg) as usize].borrow_constant())?;
+                let val = self.prepare_const(bytecode.constants[idx.get(arg) as usize].borrow_constant())?;
                 self.stack.push(val);
                 Ok(())
             }
@@ -352,8 +324,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                 self.return_value(val)
             }
             Instruction::ReturnConst { idx } => {
-                let val = self
-                    .prepare_const(bytecode.constants[idx.get(arg) as usize].borrow_constant())?;
+                let val = self.prepare_const(bytecode.constants[idx.get(arg) as usize].borrow_constant())?;
                 self.return_value(val)
             }
             Instruction::CompareOperation { op, .. } => {
@@ -450,43 +421,26 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                         self.builder.ins().trapnz(carry, TrapCode::INTEGER_OVERFLOW);
                         JitValue::Int(out)
                     }
-                    (BinaryOperator::Subtract, JitValue::Int(a), JitValue::Int(b)) => {
-                        JitValue::Int(self.compile_sub(a, b))
-                    }
-                    (BinaryOperator::FloorDivide, JitValue::Int(a), JitValue::Int(b)) => {
-                        JitValue::Int(self.builder.ins().sdiv(a, b))
-                    }
+                    (BinaryOperator::Subtract, JitValue::Int(a), JitValue::Int(b)) => JitValue::Int(self.compile_sub(a, b)),
+                    (BinaryOperator::FloorDivide, JitValue::Int(a), JitValue::Int(b)) => JitValue::Int(self.builder.ins().sdiv(a, b)),
                     (BinaryOperator::Divide, JitValue::Int(a), JitValue::Int(b)) => {
                         // Check if b == 0, If so trap with a division by zero error
-                        self.builder
-                            .ins()
-                            .trapz(b, TrapCode::INTEGER_DIVISION_BY_ZERO);
+                        self.builder.ins().trapz(b, TrapCode::INTEGER_DIVISION_BY_ZERO);
                         // Else convert to float and divide
                         let a_float = self.builder.ins().fcvt_from_sint(types::F64, a);
                         let b_float = self.builder.ins().fcvt_from_sint(types::F64, b);
                         JitValue::Float(self.builder.ins().fdiv(a_float, b_float))
                     }
-                    (BinaryOperator::Multiply, JitValue::Int(a), JitValue::Int(b)) => {
-                        JitValue::Int(self.builder.ins().imul(a, b))
-                    }
-                    (BinaryOperator::Modulo, JitValue::Int(a), JitValue::Int(b)) => {
-                        JitValue::Int(self.builder.ins().srem(a, b))
-                    }
-                    (BinaryOperator::Power, JitValue::Int(a), JitValue::Int(b)) => {
-                        JitValue::Int(self.compile_ipow(a, b))
-                    }
-                    (
-                        BinaryOperator::Lshift | BinaryOperator::Rshift,
-                        JitValue::Int(a),
-                        JitValue::Int(b),
-                    ) => {
+                    (BinaryOperator::Multiply, JitValue::Int(a), JitValue::Int(b)) => JitValue::Int(self.builder.ins().imul(a, b)),
+                    (BinaryOperator::Modulo, JitValue::Int(a), JitValue::Int(b)) => JitValue::Int(self.builder.ins().srem(a, b)),
+                    (BinaryOperator::Power, JitValue::Int(a), JitValue::Int(b)) => JitValue::Int(self.compile_ipow(a, b)),
+                    (BinaryOperator::Lshift | BinaryOperator::Rshift, JitValue::Int(a), JitValue::Int(b)) => {
                         // Shifts throw an exception if we have a negative shift count
                         // Remove all bits except the sign bit, and trap if its 1 (i.e. negative).
                         let sign = self.builder.ins().ushr_imm(b, 63);
-                        self.builder.ins().trapnz(
-                            sign,
-                            TrapCode::user(CustomTrapCode::NegativeShiftCount as u8).unwrap(),
-                        );
+                        self.builder
+                            .ins()
+                            .trapnz(sign, TrapCode::user(CustomTrapCode::NegativeShiftCount as u8).unwrap());
 
                         let out = if op == BinaryOperator::Lshift {
                             self.builder.ins().ishl(a, b)
@@ -495,36 +449,19 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                         };
                         JitValue::Int(out)
                     }
-                    (BinaryOperator::And, JitValue::Int(a), JitValue::Int(b)) => {
-                        JitValue::Int(self.builder.ins().band(a, b))
-                    }
-                    (BinaryOperator::Or, JitValue::Int(a), JitValue::Int(b)) => {
-                        JitValue::Int(self.builder.ins().bor(a, b))
-                    }
-                    (BinaryOperator::Xor, JitValue::Int(a), JitValue::Int(b)) => {
-                        JitValue::Int(self.builder.ins().bxor(a, b))
-                    }
+                    (BinaryOperator::And, JitValue::Int(a), JitValue::Int(b)) => JitValue::Int(self.builder.ins().band(a, b)),
+                    (BinaryOperator::Or, JitValue::Int(a), JitValue::Int(b)) => JitValue::Int(self.builder.ins().bor(a, b)),
+                    (BinaryOperator::Xor, JitValue::Int(a), JitValue::Int(b)) => JitValue::Int(self.builder.ins().bxor(a, b)),
 
                     // Floats
-                    (BinaryOperator::Add, JitValue::Float(a), JitValue::Float(b)) => {
-                        JitValue::Float(self.builder.ins().fadd(a, b))
-                    }
-                    (BinaryOperator::Subtract, JitValue::Float(a), JitValue::Float(b)) => {
-                        JitValue::Float(self.builder.ins().fsub(a, b))
-                    }
-                    (BinaryOperator::Multiply, JitValue::Float(a), JitValue::Float(b)) => {
-                        JitValue::Float(self.builder.ins().fmul(a, b))
-                    }
-                    (BinaryOperator::Divide, JitValue::Float(a), JitValue::Float(b)) => {
-                        JitValue::Float(self.builder.ins().fdiv(a, b))
-                    }
-                    (BinaryOperator::Power, JitValue::Float(a), JitValue::Float(b)) => {
-                        JitValue::Float(self.compile_fpow(a, b))
-                    }
+                    (BinaryOperator::Add, JitValue::Float(a), JitValue::Float(b)) => JitValue::Float(self.builder.ins().fadd(a, b)),
+                    (BinaryOperator::Subtract, JitValue::Float(a), JitValue::Float(b)) => JitValue::Float(self.builder.ins().fsub(a, b)),
+                    (BinaryOperator::Multiply, JitValue::Float(a), JitValue::Float(b)) => JitValue::Float(self.builder.ins().fmul(a, b)),
+                    (BinaryOperator::Divide, JitValue::Float(a), JitValue::Float(b)) => JitValue::Float(self.builder.ins().fdiv(a, b)),
+                    (BinaryOperator::Power, JitValue::Float(a), JitValue::Float(b)) => JitValue::Float(self.compile_fpow(a, b)),
 
                     // Floats and Integers
-                    (_, JitValue::Int(a), JitValue::Float(b))
-                    | (_, JitValue::Float(a), JitValue::Int(b)) => {
+                    (_, JitValue::Int(a), JitValue::Float(b)) | (_, JitValue::Float(a), JitValue::Int(b)) => {
                         let operand_one = match a_type.unwrap() {
                             JitType::Int => self.builder.ins().fcvt_from_sint(types::F64, a),
                             _ => a,
@@ -536,21 +473,11 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                         };
 
                         match op {
-                            BinaryOperator::Add => {
-                                JitValue::Float(self.builder.ins().fadd(operand_one, operand_two))
-                            }
-                            BinaryOperator::Subtract => {
-                                JitValue::Float(self.builder.ins().fsub(operand_one, operand_two))
-                            }
-                            BinaryOperator::Multiply => {
-                                JitValue::Float(self.builder.ins().fmul(operand_one, operand_two))
-                            }
-                            BinaryOperator::Divide => {
-                                JitValue::Float(self.builder.ins().fdiv(operand_one, operand_two))
-                            }
-                            BinaryOperator::Power => {
-                                JitValue::Float(self.compile_fpow(operand_one, operand_two))
-                            }
+                            BinaryOperator::Add => JitValue::Float(self.builder.ins().fadd(operand_one, operand_two)),
+                            BinaryOperator::Subtract => JitValue::Float(self.builder.ins().fsub(operand_one, operand_two)),
+                            BinaryOperator::Multiply => JitValue::Float(self.builder.ins().fmul(operand_one, operand_two)),
+                            BinaryOperator::Divide => JitValue::Float(self.builder.ins().fdiv(operand_one, operand_two)),
+                            BinaryOperator::Power => JitValue::Float(self.compile_fpow(operand_one, operand_two)),
                             _ => return Err(JitCompileError::NotSupported),
                         }
                     }
@@ -684,10 +611,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let hi_new = self.builder.ins().fadd(s, lo_sum);
         let hi_new_minus_s = self.builder.ins().fsub(hi_new, s);
         let lo_new = self.builder.ins().fsub(lo_sum, hi_new_minus_s);
-        DDValue {
-            hi: hi_new,
-            lo: lo_new,
-        }
+        DDValue { hi: hi_new, lo: lo_new }
     }
 
     /// Subtracts DDValue b from DDValue a by negating b and then using the addition function.
@@ -726,10 +650,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let hi_new = self.builder.ins().fadd(s, lo_sum);
         let hi_new_minus_s = self.builder.ins().fsub(hi_new, s);
         let lo_new = self.builder.ins().fsub(lo_sum, hi_new_minus_s);
-        DDValue {
-            hi: hi_new,
-            lo: lo_new,
-        }
+        DDValue { hi: hi_new, lo: lo_new }
     }
 
     /// Multiplies a DDValue by a regular f64 (Value) using similar techniques as dd_mul.
@@ -758,10 +679,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let hi_new = self.builder.ins().fadd(s, lo_sum);
         let hi_new_minus_s = self.builder.ins().fsub(hi_new, s);
         let lo_new = self.builder.ins().fsub(lo_sum, hi_new_minus_s);
-        DDValue {
-            hi: hi_new,
-            lo: lo_new,
-        }
+        DDValue { hi: hi_new, lo: lo_new }
     }
 
     /// Scales a DDValue by multiplying both its high and low parts by the given factor.
@@ -814,10 +732,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let zero_f64 = self.builder.ins().f64const(0.0);
 
         // Check if x is less than or equal to 0 or is NaN.
-        let cmp_le = self
-            .builder
-            .ins()
-            .fcmp(FloatCC::LessThanOrEqual, x, zero_f64);
+        let cmp_le = self.builder.ins().fcmp(FloatCC::LessThanOrEqual, x, zero_f64);
         let cmp_nan = self.builder.ins().fcmp(FloatCC::Unordered, x, x);
         let need_nan = self.builder.ins().bor(cmp_le, cmp_nan);
 
@@ -850,10 +765,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         // (F) Force the exponent bits to 1023, yielding a mantissa m in [1, 2).
         let new_exp = self.builder.ins().iconst(types::I64, 0x3FF0_0000_0000_0000);
         let fraction_bits = self.builder.ins().bor(fraction_with_leading_one, new_exp);
-        let m = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlags::new(), fraction_bits);
+        let m = self.builder.ins().bitcast(types::F64, MemFlags::new(), fraction_bits);
 
         // (G) Compute ln(m) using the series ln(1+f) with f = m - 1.
         let one_f64 = self.builder.ins().f64const(1.0);
@@ -861,10 +773,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let dd_ln_m = self.dd_ln_1p_series(f_val);
 
         // (H) Compute k*ln2 in double–double arithmetic.
-        let ln2_dd = self.dd_from_parts(
-            f64::from_bits(0x3fe62e42fefa39ef),
-            f64::from_bits(0x3c7abc9e3b39803f),
-        );
+        let ln2_dd = self.dd_from_parts(f64::from_bits(0x3fe62e42fefa39ef), f64::from_bits(0x3c7abc9e3b39803f));
         let k_f64 = self.builder.ins().fcvt_from_sint(types::F64, k_i64);
         let dd_ln2_k = self.dd_mul_f64(ln2_dd, k_f64);
 
@@ -872,19 +781,10 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let normal_result = self.dd_add(dd_ln_m, dd_ln2_k);
 
         // (I) If x was nonpositive or NaN, return NaN; otherwise, return the computed result.
-        let final_hi = self
-            .builder
-            .ins()
-            .select(need_nan, dd_nan.hi, normal_result.hi);
-        let final_lo = self
-            .builder
-            .ins()
-            .select(need_nan, dd_nan.lo, normal_result.lo);
+        let final_hi = self.builder.ins().select(need_nan, dd_nan.hi, normal_result.hi);
+        let final_lo = self.builder.ins().select(need_nan, dd_nan.lo, normal_result.lo);
 
-        DDValue {
-            hi: final_hi,
-            lo: final_lo,
-        }
+        DDValue { hi: final_hi, lo: final_lo }
     }
 
     /// Computes the exponential function exp(x) in double–double arithmetic.
@@ -893,10 +793,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
     fn dd_exp(&mut self, dd: DDValue) -> DDValue {
         // (A) Range reduction: Convert dd to a single f64 value.
         let x = self.dd_to_f64(dd.clone());
-        let ln2_f64 = self
-            .builder
-            .ins()
-            .f64const(f64::from_bits(0x3fe62e42fefa39ef));
+        let ln2_f64 = self.builder.ins().f64const(f64::from_bits(0x3fe62e42fefa39ef));
         let div = self.builder.ins().fdiv(x, ln2_f64);
         let half = self.builder.ins().f64const(0.5);
         let div_plus_half = self.builder.ins().fadd(div, half);
@@ -914,10 +811,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
 
         // (B) Compute exp(x) normally when not overflowing.
         // Compute k*ln2 in double–double arithmetic and subtract it from x.
-        let ln2_dd = self.dd_from_parts(
-            f64::from_bits(0x3fe62e42fefa39ef),
-            f64::from_bits(0x3c7abc9e3b39803f),
-        );
+        let ln2_dd = self.dd_from_parts(f64::from_bits(0x3fe62e42fefa39ef), f64::from_bits(0x3c7abc9e3b39803f));
         let k_f64 = self.builder.ins().fcvt_from_sint(types::F64, k);
         let k_ln2 = self.dd_mul_f64(ln2_dd, k_f64);
         let r = self.dd_sub(dd, k_ln2);
@@ -939,19 +833,13 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let k_plus_bias = self.builder.ins().iadd(k, bias);
         let shift_count = self.builder.ins().iconst(types::I64, 52);
         let shifted = self.builder.ins().ishl(k_plus_bias, shift_count);
-        let two_to_k = self
-            .builder
-            .ins()
-            .bitcast(types::F64, MemFlags::new(), shifted);
+        let two_to_k = self.builder.ins().bitcast(types::F64, MemFlags::new(), shifted);
         let result = self.dd_scale(sum, two_to_k);
 
         // (C) If overflow was detected, return infinity; otherwise, return the computed value.
         let final_hi = self.builder.ins().select(is_overflow, inf, result.hi);
         let final_lo = self.builder.ins().select(is_overflow, zero, result.lo);
-        DDValue {
-            hi: final_hi,
-            lo: final_lo,
-        }
+        DDValue { hi: final_hi, lo: final_lo }
     }
 
     /// Computes the power function a^b (f_pow) for f64 values using double–double arithmetic for high precision.
@@ -976,9 +864,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let cmp_b_zero = self.builder.ins().fcmp(FloatCC::Equal, b, zero_f);
         let b_zero_block = self.builder.create_block();
         let continue_block = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cmp_b_zero, b_zero_block, &[], continue_block, &[]);
+        self.builder.ins().brif(cmp_b_zero, b_zero_block, &[], continue_block, &[]);
         self.builder.switch_to_block(b_zero_block);
         self.builder.ins().jump(merge_block, &[one_f]);
         self.builder.switch_to_block(continue_block);
@@ -987,9 +873,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let cmp_b_nan = self.builder.ins().fcmp(FloatCC::Unordered, b, b);
         let b_nan_block = self.builder.create_block();
         let continue_block2 = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cmp_b_nan, b_nan_block, &[], continue_block2, &[]);
+        self.builder.ins().brif(cmp_b_nan, b_nan_block, &[], continue_block2, &[]);
         self.builder.switch_to_block(b_nan_block);
         self.builder.ins().jump(merge_block, &[nan_f]);
         self.builder.switch_to_block(continue_block2);
@@ -998,9 +882,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let cmp_a_zero = self.builder.ins().fcmp(FloatCC::Equal, a, zero_f);
         let a_zero_block = self.builder.create_block();
         let continue_block3 = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cmp_a_zero, a_zero_block, &[], continue_block3, &[]);
+        self.builder.ins().brif(cmp_a_zero, a_zero_block, &[], continue_block3, &[]);
         self.builder.switch_to_block(a_zero_block);
         self.builder.ins().jump(merge_block, &[zero_f]);
         self.builder.switch_to_block(continue_block3);
@@ -1009,9 +891,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let cmp_a_nan = self.builder.ins().fcmp(FloatCC::Unordered, a, a);
         let a_nan_block = self.builder.create_block();
         let continue_block4 = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cmp_a_nan, a_nan_block, &[], continue_block4, &[]);
+        self.builder.ins().brif(cmp_a_nan, a_nan_block, &[], continue_block4, &[]);
         self.builder.switch_to_block(a_nan_block);
         self.builder.ins().jump(merge_block, &[nan_f]);
         self.builder.switch_to_block(continue_block4);
@@ -1020,9 +900,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let cmp_b_inf = self.builder.ins().fcmp(FloatCC::Equal, b, inf_f);
         let b_inf_block = self.builder.create_block();
         let continue_block5 = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cmp_b_inf, b_inf_block, &[], continue_block5, &[]);
+        self.builder.ins().brif(cmp_b_inf, b_inf_block, &[], continue_block5, &[]);
         self.builder.switch_to_block(b_inf_block);
         self.builder.ins().jump(merge_block, &[inf_f]);
         self.builder.switch_to_block(continue_block5);
@@ -1031,9 +909,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let cmp_b_neg_inf = self.builder.ins().fcmp(FloatCC::Equal, b, neg_inf_f);
         let b_neg_inf_block = self.builder.create_block();
         let continue_block6 = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cmp_b_neg_inf, b_neg_inf_block, &[], continue_block6, &[]);
+        self.builder.ins().brif(cmp_b_neg_inf, b_neg_inf_block, &[], continue_block6, &[]);
         self.builder.switch_to_block(b_neg_inf_block);
         self.builder.ins().jump(merge_block, &[zero_f]);
         self.builder.switch_to_block(continue_block6);
@@ -1042,9 +918,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let cmp_a_inf = self.builder.ins().fcmp(FloatCC::Equal, a, inf_f);
         let a_inf_block = self.builder.create_block();
         let continue_block7 = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cmp_a_inf, a_inf_block, &[], continue_block7, &[]);
+        self.builder.ins().brif(cmp_a_inf, a_inf_block, &[], continue_block7, &[]);
         self.builder.switch_to_block(a_inf_block);
         self.builder.ins().jump(merge_block, &[inf_f]);
         self.builder.switch_to_block(continue_block7);
@@ -1053,9 +927,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let cmp_a_neg_inf = self.builder.ins().fcmp(FloatCC::Equal, a, neg_inf_f);
         let a_neg_inf_block = self.builder.create_block();
         let continue_block8 = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cmp_a_neg_inf, a_neg_inf_block, &[], continue_block8, &[]);
+        self.builder.ins().brif(cmp_a_neg_inf, a_neg_inf_block, &[], continue_block8, &[]);
 
         self.builder.switch_to_block(a_neg_inf_block);
         // a is -infinity here. First, ensure that b is an integer.
@@ -1063,9 +935,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let cmp_int = self.builder.ins().fcmp(FloatCC::Equal, b_floor, b);
         let domain_error_blk = self.builder.create_block();
         let continue_neg_inf = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cmp_int, continue_neg_inf, &[], domain_error_blk, &[]);
+        self.builder.ins().brif(cmp_int, continue_neg_inf, &[], domain_error_blk, &[]);
 
         self.builder.switch_to_block(domain_error_blk);
         self.builder.ins().jump(merge_block, &[nan_f]);
@@ -1083,9 +953,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let even_block = self.builder.create_block();
         self.builder.append_block_param(odd_block, f64_ty);
         self.builder.append_block_param(even_block, f64_ty);
-        self.builder
-            .ins()
-            .brif(is_odd, odd_block, &[neg_inf_f], even_block, &[inf_f]);
+        self.builder.ins().brif(is_odd, odd_block, &[neg_inf_f], even_block, &[inf_f]);
 
         self.builder.switch_to_block(odd_block);
         let phi_neg_inf = self.builder.block_params(odd_block)[0];
@@ -1102,9 +970,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let cmp_lt = self.builder.ins().fcmp(FloatCC::LessThan, a, zero_f);
         let a_neg_block = self.builder.create_block();
         let a_pos_block = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cmp_lt, a_neg_block, &[], a_pos_block, &[]);
+        self.builder.ins().brif(cmp_lt, a_neg_block, &[], a_pos_block, &[]);
 
         // ----- Case: a > 0: Compute a^b = exp(b * ln(a)) using double–double arithmetic.
         self.builder.switch_to_block(a_pos_block);
@@ -1121,9 +987,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let cmp_int = self.builder.ins().fcmp(FloatCC::Equal, b_floor, b);
         let neg_int_block = self.builder.create_block();
         let domain_error_blk = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(cmp_int, neg_int_block, &[], domain_error_blk, &[]);
+        self.builder.ins().brif(cmp_int, neg_int_block, &[], domain_error_blk, &[]);
 
         // Domain error: non-integer exponent for negative base
         self.builder.switch_to_block(domain_error_blk);
@@ -1150,9 +1014,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         self.builder.append_block_param(odd_block, f64_ty);
         self.builder.append_block_param(even_block, f64_ty);
         // Pass mag_val to both branches:
-        self.builder
-            .ins()
-            .brif(is_odd, odd_block, &[mag_val], even_block, &[mag_val]);
+        self.builder.ins().brif(is_odd, odd_block, &[mag_val], even_block, &[mag_val]);
 
         self.builder.switch_to_block(odd_block);
         let phi_mag_val = self.builder.block_params(odd_block)[0];
@@ -1206,10 +1068,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         let exp_check = params[0];
         let base_check = params[1];
 
-        let is_negative = self
-            .builder
-            .ins()
-            .icmp(IntCC::SignedLessThan, exp_check, zero);
+        let is_negative = self.builder.ins().icmp(IntCC::SignedLessThan, exp_check, zero);
         self.builder.ins().brif(
             is_negative,
             handle_negative,
@@ -1231,13 +1090,9 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
 
         // Check if exponent is zero
         let is_zero = self.builder.ins().icmp(IntCC::Equal, exp_phi, zero);
-        self.builder.ins().brif(
-            is_zero,
-            exit_block,
-            &[result_phi],
-            continue_block,
-            &[exp_phi, result_phi, base_phi],
-        );
+        self.builder
+            .ins()
+            .brif(is_zero, exit_block, &[result_phi], continue_block, &[exp_phi, result_phi, base_phi]);
 
         // Continue block for non-zero case
         self.builder.switch_to_block(continue_block);
@@ -1255,9 +1110,7 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         // Square the base and divide exponent by 2
         let squared_base = self.builder.ins().imul(base_phi, base_phi);
         let new_exp = self.builder.ins().sshr_imm(exp_phi, 1);
-        self.builder
-            .ins()
-            .jump(loop_block, &[new_exp, new_result, squared_base]);
+        self.builder.ins().jump(loop_block, &[new_exp, new_result, squared_base]);
 
         // Exit block
         self.builder.switch_to_block(exit_block);
@@ -1271,5 +1124,392 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
         self.builder.seal_block(exit_block);
 
         res
+    }
+}
+
+// #[derive(Debug, Clone)]
+// pub enum MyStackValue {
+//     None,
+//     Int(i64),
+//     Float64(f64),
+//     String(String),
+//     Tuple(Vec<MyStackValue>),
+// }
+//
+// impl MyStackValue {}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum LhsExpression {
+    // Name(String),
+    Const(usize),
+    Variable(usize),
+}
+
+impl Debug for LhsExpression {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LhsExpression::Const(varindex) => write!(f, "$lhs.const.{}", varindex),
+            LhsExpression::Variable(varindex) => write!(f, "$lhs.var.{}", varindex),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum RhsExpression {
+    None,
+    Variable(usize),
+    Int(i64),
+    Float64(f64),
+    // String(String),
+    Struct(Vec<LhsExpression>),
+    BinaryOp(BinaryOperator, LhsExpression, LhsExpression),
+    CompareOp(ComparisonOperator, LhsExpression, LhsExpression),
+    Subscript(LhsExpression, LhsExpression),
+}
+
+impl Debug for RhsExpression {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RhsExpression::None => write!(f, "$rhs.none")?,
+            RhsExpression::Variable(v) => write!(f, "$rhs.var.{}", v)?,
+            RhsExpression::Int(v) => write!(f, "$rhs.int({})", v)?,
+            RhsExpression::Float64(v) => write!(f, "$rhs.float({})", v)?,
+            RhsExpression::Struct(v) => write!(f, "$rhs.struct{:?}", v)?,
+            RhsExpression::BinaryOp(op, a, b) => write!(f, "$rhs.{:?}({:?}, {:?})", op, a, b)?,
+            RhsExpression::CompareOp(op, a, b) => write!(f, "$rhs.{:?}({:?}, {:?})", op, a, b)?,
+            RhsExpression::Subscript(a, b) => write!(f, "$rhs.{:?}[{:?}]", a, b)?,
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+enum MyStatement {
+    Assign(LhsExpression, RhsExpression),
+    Jump(usize),
+    Return(LhsExpression),
+}
+
+#[derive(Debug, Clone, Default)]
+struct MyBlock {
+    statements: Vec<MyStatement>,
+    comments: HashMap<usize, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionTranspiler<'a, C>
+where
+    C: Constant,
+{
+    varname_to_varindex: HashMap<String, usize>,
+    varnum_to_varindex: HashMap<usize, usize>,
+    variables_state: HashMap<usize, usize>,
+    variable_idx: usize,
+    code_object: &'a CodeObject<C>,
+    blocks: BTreeMap<usize, MyBlock>,
+    current_label: usize,
+}
+
+impl<'a, C> FunctionTranspiler<'a, C>
+where
+    C: Constant,
+{
+    pub fn new(code_object: &'a CodeObject<C>) -> Self {
+        println!("=========================");
+        println!("instructions:");
+        for (offset, inst) in code_object.instructions.iter().enumerate() {
+            println!("{} => {:?} => {:?}", offset, inst.op, inst.arg);
+        }
+        println!("varnames:");
+        for (idx, varname) in code_object.varnames.iter().enumerate() {
+            println!("{} {}", idx, varname.as_ref().to_string());
+        }
+        println!("constants:");
+        for (idx, constant) in code_object.constants.iter().enumerate() {
+            println!("{} {:?}", idx, constant.borrow_constant());
+        }
+        println!("=========================");
+
+        let mut result = Self {
+            varname_to_varindex: HashMap::with_capacity(1024),
+            varnum_to_varindex: HashMap::with_capacity(1024),
+            variables_state: HashMap::with_capacity(1024),
+            variable_idx: 0,
+            code_object,
+            blocks: BTreeMap::default(),
+            current_label: 0,
+        };
+
+        let mut block = MyBlock::default();
+        for (varnum, varname) in code_object.varnames.iter().enumerate() {
+            let varname_str = varname.as_ref().to_string();
+            let varindex = result.create_new_variable();
+            block.comments.insert(varindex, format!("variable >> '{}'", varname_str));
+            block
+                .statements
+                .push(MyStatement::Assign(LhsExpression::Variable(varindex), RhsExpression::None));
+            result.varname_to_varindex.insert(varname_str, varindex);
+            result.varnum_to_varindex.insert(varnum, varindex);
+        }
+        result.blocks.insert(0, block);
+
+        result
+    }
+
+    fn convert_borrowed_constant_to_rhs_expression(&mut self, value: BorrowedConstant<'_, C>) -> RhsExpression {
+        match value {
+            BorrowedConstant::Integer { value } => RhsExpression::Int(value.to_i64().unwrap()),
+            BorrowedConstant::Float { value } => RhsExpression::Float64(value),
+            BorrowedConstant::Boolean { value } => {
+                if value {
+                    RhsExpression::Int(1)
+                } else {
+                    RhsExpression::Int(0)
+                }
+            }
+            BorrowedConstant::Str { value } => {
+                let varindex = *self.varname_to_varindex.get(value.as_str().unwrap()).unwrap();
+                RhsExpression::Variable(varindex)
+            }
+            BorrowedConstant::Bytes { .. } => {
+                todo!()
+            }
+            BorrowedConstant::Code { .. } => {
+                todo!()
+            }
+            BorrowedConstant::Tuple { .. } => {
+                todo!()
+            }
+            BorrowedConstant::None => {
+                todo!()
+            }
+            BorrowedConstant::Complex { .. } => {
+                todo!()
+            }
+            BorrowedConstant::Ellipsis => {
+                todo!()
+            }
+        }
+    }
+    pub fn transpile(&mut self) {
+        let label_targets = self.code_object.label_targets().iter().map(|s| s.0 as usize).collect::<HashSet<usize>>();
+        let mut arg_state = OpArgState::default();
+
+        // Track whether we have "returned" in the current block
+        let mut in_unreachable_code = false;
+
+        for (label, &raw_instr) in self.code_object.instructions.iter().enumerate() {
+            println!("{} => {:?} => {:?}", label, raw_instr.op, raw_instr.arg);
+            let (instruction, arg) = arg_state.get(raw_instr);
+
+            // If this is a label that some earlier jump can target,
+            // treat it as the start of a new reachable block:
+            if label_targets.contains(&label) {
+                // Create or get the block for this label:
+                self.blocks.insert(label, MyBlock::default());
+                self.current_label = label;
+
+                // We are definitely reachable again at this label
+                in_unreachable_code = false;
+            }
+
+            // If we're in unreachable code, skip this instruction unless the label re-entered above.
+            if in_unreachable_code {
+                continue;
+            }
+
+            // Actually compile this instruction:
+            let statements = self.add_instruction(instruction, arg);
+
+            let block = self.blocks.get_mut(&self.current_label).unwrap();
+
+            for statement in statements.iter() {
+                match statement {
+                    MyStatement::Assign(LhsExpression::Variable(varindex), _) => {
+                        block.comments.insert(
+                            *varindex,
+                            format!("instruction >> {} >> {:?} >> {:?}", label, raw_instr.op, raw_instr.arg),
+                        );
+                    }
+                    MyStatement::Assign(LhsExpression::Const(varindex), _) => {
+                        block.comments.insert(
+                            *varindex,
+                            format!("instruction >> {} >> {:?} >> {:?}", label, raw_instr.op, raw_instr.arg),
+                        );
+                    }
+                    MyStatement::Return(expr) => match expr {
+                        LhsExpression::Const(varindex) => {
+                            block.comments.insert(
+                                *varindex,
+                                format!("instruction >> {} >> {:?} >> {:?}", label, raw_instr.op, raw_instr.arg),
+                            );
+                        }
+                        LhsExpression::Variable(varindex) => {
+                            block.comments.insert(
+                                *varindex,
+                                format!("instruction >> {} >> {:?} >> {:?}", label, raw_instr.op, raw_instr.arg),
+                            );
+                        }
+                    },
+                    MyStatement::Jump(label) => {}
+                };
+            }
+            block.statements.extend(statements);
+
+            // If that was a return instruction, mark future instructions unreachable
+            match instruction {
+                Instruction::ReturnValue | Instruction::ReturnConst { .. } => {
+                    in_unreachable_code = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn create_new_variable(&mut self) -> usize {
+        let variable_idx = self.variable_idx;
+        self.variable_idx += 1;
+        variable_idx
+    }
+
+    pub fn add_instruction(&mut self, instruction: Instruction, arg: OpArg) -> Vec<MyStatement> {
+        match instruction {
+            Instruction::ExtendedArg => todo!(),
+            Instruction::JumpIfFalse { target } => {
+                let target = target.get(arg);
+                vec![MyStatement::Jump(target.0 as usize)]
+            }
+            Instruction::JumpIfTrue { target } => {
+                self.print();
+                todo!()
+            }
+
+            Instruction::Jump { target } => {
+                self.print();
+                todo!()
+            }
+            Instruction::LoadFast(op_arg) => {
+                let idx = op_arg.get(arg) as usize;
+                let varname = self.code_object.varnames.get(idx).unwrap();
+                let varname_str = varname.as_ref().to_string();
+                let varindex_lhs = self.create_new_variable();
+                let varindex_rhs = self.varname_to_varindex.get(&varname_str).unwrap().clone();
+                vec![MyStatement::Assign(
+                    LhsExpression::Variable(varindex_lhs),
+                    RhsExpression::Variable(varindex_rhs),
+                )]
+            }
+            Instruction::StoreFast(op_arg) => {
+                let idx = op_arg.get(arg) as usize;
+
+                let varindex_lhs = *self.varnum_to_varindex.get(&idx).unwrap();
+                let varindex_rhs = self.variable_idx - 1;
+                vec![MyStatement::Assign(
+                    LhsExpression::Variable(varindex_lhs),
+                    RhsExpression::Variable(varindex_rhs),
+                )]
+            }
+            Instruction::LoadConst { idx } => {
+                let idx = idx.get(arg) as usize;
+                let value = self.code_object.constants.get(idx).unwrap().borrow_constant();
+                let value = self.convert_borrowed_constant_to_rhs_expression(value);
+                let varindex_lhs = self.create_new_variable();
+                vec![MyStatement::Assign(LhsExpression::Variable(varindex_lhs), value)]
+            }
+            Instruction::BuildTuple { size } => {
+                let size = size.get(arg) as usize;
+
+                let tuple = (1..=size)
+                    .map(|offset| self.variable_idx - offset)
+                    .map(|varindex| LhsExpression::Variable(varindex))
+                    .collect::<Vec<_>>();
+                let varindex_lhs = self.create_new_variable();
+                vec![MyStatement::Assign(LhsExpression::Variable(varindex_lhs), RhsExpression::Struct(tuple))]
+            }
+            Instruction::UnpackSequence { size } => {
+                self.print();
+                todo!()
+            }
+            Instruction::ReturnValue => {
+                let varindex_return = self.variable_idx - 1;
+                vec![MyStatement::Return(LhsExpression::Variable(varindex_return))]
+            }
+            Instruction::ReturnConst { idx } => {
+                let varindex = idx.get(arg) as usize;
+                vec![MyStatement::Return(LhsExpression::Const(varindex))]
+            }
+            Instruction::CompareOperation { op, .. } => {
+                let op = op.get(arg);
+                let a = LhsExpression::Variable(self.variable_idx - 2);
+                let b = LhsExpression::Variable(self.variable_idx - 1);
+                let lhs = self.create_new_variable();
+                vec![MyStatement::Assign(LhsExpression::Variable(lhs), RhsExpression::CompareOp(op, a, b))]
+            }
+            Instruction::UnaryOperation { op, .. } => {
+                self.print();
+                todo!()
+            }
+            Instruction::BinaryOperation { op } | Instruction::BinaryOperationInplace { op } => {
+                let op = op.get(arg);
+
+                let lhs = LhsExpression::Variable(self.variable_idx - 2);
+                let rhs = LhsExpression::Variable(self.variable_idx - 1);
+                let variable_lhs = self.create_new_variable();
+                vec![MyStatement::Assign(
+                    LhsExpression::Variable(variable_lhs),
+                    RhsExpression::BinaryOp(op, lhs, rhs),
+                )]
+            }
+            Instruction::SetupLoop => {
+                self.print();
+                todo!()
+            }
+            Instruction::PopBlock => {
+                self.print();
+                todo!()
+            }
+            Instruction::LoadGlobal(idx) => {
+                self.print();
+                todo!()
+            }
+            Instruction::CallFunctionPositional { nargs } => {
+                self.print();
+                todo!()
+            }
+            Instruction::Subscript => {
+                let varindex_container = LhsExpression::Variable(self.variable_idx - 2);
+                let varindex_key = LhsExpression::Variable(self.variable_idx - 1);
+                let variable_lhs = self.create_new_variable();
+                vec![MyStatement::Assign(
+                    LhsExpression::Variable(variable_lhs),
+                    RhsExpression::Subscript(varindex_container, varindex_key),
+                )]
+            }
+            o => todo!("o:{:?}", o),
+        }
+    }
+
+    pub fn print(&self) {
+        println!("^^^^^^^^^^^^^^^^^^^^^^^^^^^");
+        println!("variables_state:");
+        for (k, v) in self.variables_state.iter() {
+            println!("{} => {:?}", k, v);
+        }
+        println!("^^^^^^^^^^^^^^^^^^^^^^^^^^^");
+        for (idx, block) in self.blocks.iter() {
+            println!("block {}:", idx);
+            for (idx, statement) in block.statements.iter().enumerate() {
+                match statement {
+                    MyStatement::Assign(lhs, rhs) => {
+                        println!("\t{} {:?} = {:?}", idx, lhs, rhs);
+                    }
+                    MyStatement::Return(lhs) => {
+                        println!("\t{} return {:?}", idx, lhs);
+                    }
+                    MyStatement::Jump(target) => println!("\t{} jump {}", idx, target),
+                }
+            }
+        }
     }
 }

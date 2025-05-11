@@ -2,4 +2,4 @@ bin/
 pkg/
 dist/
 node_modules/
-
+wasm-unknown-test

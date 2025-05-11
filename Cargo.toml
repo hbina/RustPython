@@ -10,7 +10,7 @@ repository.workspace = true
 license.workspace = true
 
 [features]
-default = ["threading", "stdlib", "stdio", "importlib"]
+default = ["threading", "stdlib", "stdio", "importlib", "jit"]
 importlib = ["rustpython-vm/importlib"]
 encodings = ["rustpython-vm/encodings"]
 stdio = ["rustpython-vm/stdio"]
@@ -62,13 +62,13 @@ harness = false
 name = "rustpython"
 path = "src/main.rs"
 
-[profile.dev.package."*"]
-opt-level = 3
-
-[profile.test]
-opt-level = 3
-# https://github.com/rust-lang/rust/issues/92869
-# lto = "thin"
+#[profile.dev.package."*"]
+#opt-level = 3
+#
+#[profile.test]
+#opt-level = 3
+## https://github.com/rust-lang/rust/issues/92869
+## lto = "thin"
 
 [profile.bench]
 lto = "thin"

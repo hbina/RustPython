@@ -1,8 +1,9 @@
 use rustpython_compiler_core::bytecode::{
     CodeObject, ConstantData, Instruction, OpArg, OpArgState,
 };
+use rustpython_jit::code_flow::CodeFlow;
 use rustpython_jit::{CompiledCode, JitType};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 #[derive(Debug, Clone)]
@@ -77,6 +78,28 @@ impl StackMachine {
     }
 
     pub fn run(&mut self, code: CodeObject) {
+        let mut code_flow = CodeFlow::new(&code);
+        let mut oparg_state = OpArgState::default();
+        println!("constants:");
+        for (offset, word) in code.constants.iter().enumerate() {
+            println!("{} {:?}", offset, word);
+        }
+        println!("names:");
+        for (offset, word) in code.names.iter().enumerate() {
+            println!("{} {:?}", offset, word);
+        }
+        println!("instructions:");
+        for (offset, word) in code.instructions.iter().enumerate() {
+            println!("{} {:?}", offset, word);
+        }
+        for word in code.instructions.iter() {
+            let (instruction, arg) = oparg_state.get(*word);
+            match code_flow.process_instruction(instruction, arg) {
+                ControlFlow::Continue(a) => continue,
+                ControlFlow::Break(a) => break,
+            }
+        }
+
         let mut oparg_state = OpArgState::default();
         let _ = code.instructions.iter().try_for_each(|&word| {
             let (instruction, arg) = oparg_state.get(word);
