@@ -1138,8 +1138,8 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
 //
 // impl MyStackValue {}
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum LhsExpression {
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub enum LhsExpression {
     // Name(String),
     Const(usize),
     Variable(usize),
@@ -1155,8 +1155,8 @@ impl Debug for LhsExpression {
 }
 
 #[derive(Clone)]
-enum RhsExpression {
-    None,
+pub enum RhsExpression {
+    Varname(String),
     Variable(usize),
     Int(i64),
     Float64(f64),
@@ -1170,7 +1170,7 @@ enum RhsExpression {
 impl Debug for RhsExpression {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            RhsExpression::None => write!(f, "$rhs.none")?,
+            RhsExpression::Varname(s) => write!(f, "$rhs.varname({s})")?,
             RhsExpression::Variable(v) => write!(f, "$rhs.var.{}", v)?,
             RhsExpression::Int(v) => write!(f, "$rhs.int({})", v)?,
             RhsExpression::Float64(v) => write!(f, "$rhs.float({})", v)?,
@@ -1185,16 +1185,31 @@ impl Debug for RhsExpression {
 }
 
 #[derive(Debug, Clone)]
-enum MyStatement {
+pub enum MyStatement {
     Assign(LhsExpression, RhsExpression),
     Jump(usize),
     Return(LhsExpression),
 }
 
 #[derive(Debug, Clone, Default)]
-struct MyBlock {
+pub struct MyBlock {
     statements: Vec<MyStatement>,
     comments: HashMap<usize, String>,
+}
+
+impl MyBlock {
+    pub fn get_comment_for_lhs(&self, lhs: &LhsExpression) -> String {
+        let comment = match lhs {
+            LhsExpression::Const(varindex) => self.comments.get(varindex).cloned(),
+            LhsExpression::Variable(varindex) => self.comments.get(varindex).cloned(),
+        };
+        match comment {
+            Some(s) => {
+                format!("// {}", s)
+            }
+            None => "".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1204,7 +1219,6 @@ where
 {
     varname_to_varindex: HashMap<String, usize>,
     varnum_to_varindex: HashMap<usize, usize>,
-    variables_state: HashMap<usize, usize>,
     variable_idx: usize,
     code_object: &'a CodeObject<C>,
     blocks: BTreeMap<usize, MyBlock>,
@@ -1234,7 +1248,6 @@ where
         let mut result = Self {
             varname_to_varindex: HashMap::with_capacity(1024),
             varnum_to_varindex: HashMap::with_capacity(1024),
-            variables_state: HashMap::with_capacity(1024),
             variable_idx: 0,
             code_object,
             blocks: BTreeMap::default(),
@@ -1246,9 +1259,10 @@ where
             let varname_str = varname.as_ref().to_string();
             let varindex = result.create_new_variable();
             block.comments.insert(varindex, format!("variable >> '{}'", varname_str));
-            block
-                .statements
-                .push(MyStatement::Assign(LhsExpression::Variable(varindex), RhsExpression::None));
+            block.statements.push(MyStatement::Assign(
+                LhsExpression::Variable(varindex),
+                RhsExpression::Varname(varname_str.clone()),
+            ));
             result.varname_to_varindex.insert(varname_str, varindex);
             result.varnum_to_varindex.insert(varnum, varindex);
         }
@@ -1492,24 +1506,173 @@ where
 
     pub fn print(&self) {
         println!("^^^^^^^^^^^^^^^^^^^^^^^^^^^");
-        println!("variables_state:");
-        for (k, v) in self.variables_state.iter() {
-            println!("{} => {:?}", k, v);
-        }
-        println!("^^^^^^^^^^^^^^^^^^^^^^^^^^^");
         for (idx, block) in self.blocks.iter() {
             println!("block {}:", idx);
             for (idx, statement) in block.statements.iter().enumerate() {
                 match statement {
                     MyStatement::Assign(lhs, rhs) => {
-                        println!("\t{} {:?} = {:?}", idx, lhs, rhs);
+                        println!("\t{} {:?} = {:?} {}", idx, lhs, rhs, block.get_comment_for_lhs(lhs));
                     }
                     MyStatement::Return(lhs) => {
-                        println!("\t{} return {:?}", idx, lhs);
+                        println!("\t{} return {:?} {}", idx, lhs, block.get_comment_for_lhs(lhs));
                     }
                     MyStatement::Jump(target) => println!("\t{} jump {}", idx, target),
                 }
             }
+        }
+        println!("^^^^^^^^^^^^^^^^^^^^^^^^^^^");
+    }
+
+    pub fn get_all_instructions(&self) -> Vec<MyStatement> {
+        self.blocks.iter().flat_map(|(_, block)| block.statements.iter().cloned()).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MyType {
+    Int,
+    Float,
+    String,
+    Struct(Vec<LhsExpression>),
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeResolver {
+    varindex_types: HashMap<LhsExpression, HashSet<MyType>>,
+    varname_types: HashMap<String, MyType>,
+    statements: Vec<MyStatement>,
+    return_types: HashSet<MyType>,
+}
+
+impl TypeResolver {
+    pub fn new<C>(code_object: &CodeObject<C>, args: &[JitType], statements: Vec<MyStatement>) -> Self
+    where
+        C: Constant,
+    {
+        let mut varname_types = HashMap::with_capacity(1024);
+        for (idx, jit_type) in args.iter().enumerate() {
+            let key = code_object.varnames.get(idx).unwrap().as_ref().to_string();
+            let value = match jit_type {
+                JitType::Int => MyType::Int,
+                JitType::Float => MyType::Float,
+                JitType::Bool => MyType::Int,
+            };
+            varname_types.insert(key, value);
+        }
+        Self {
+            varindex_types: HashMap::new(),
+            varname_types,
+            statements,
+            return_types: HashSet::new(),
+        }
+    }
+
+    pub fn solve(&mut self) {
+        loop {
+            let prev = self.type_count();
+            self._solve();
+            let after = self.type_count();
+
+            println!("solving types prev:{} after:{}", prev, after);
+
+            if prev == after {
+                return;
+            }
+        }
+    }
+
+    pub fn _solve(&mut self) {
+        for statement in self.statements.iter() {
+            match statement {
+                MyStatement::Assign(lhs, rhs) => match rhs {
+                    RhsExpression::Varname(s) => {
+                        match self.varname_types.get(s) {
+                            Some(s) => {
+                                self.varindex_types.entry(lhs.clone()).or_insert(HashSet::default()).insert(s.clone());
+                            }
+                            None => {}
+                        };
+                    }
+                    RhsExpression::Variable(varindex) => {
+                        let types = self
+                            .varindex_types
+                            .get_mut(&LhsExpression::Variable(*varindex))
+                            .cloned()
+                            .unwrap_or_default();
+                        self.varindex_types.entry(*lhs).or_default().extend(types);
+                    }
+                    RhsExpression::Int(_) => {
+                        self.varindex_types.entry(*lhs).or_default().insert(MyType::Int);
+                    }
+                    RhsExpression::Float64(_) => {
+                        self.varindex_types.entry(*lhs).or_default().insert(MyType::Float);
+                    }
+                    RhsExpression::Struct(s) => {
+                        self.varindex_types.entry(*lhs).or_default().insert(MyType::Struct(s.clone()));
+                    }
+                    RhsExpression::BinaryOp(op, a, b) => {
+                        let types_a = self.varindex_types.get(a).cloned().unwrap_or(HashSet::default());
+                        let types_b = self.varindex_types.get(b).cloned().unwrap_or(HashSet::default());
+                        let product_pairs = types_a
+                            .iter()
+                            .map(|item_x| types_b.iter().map(move |item_y| (item_x, item_y)))
+                            .flatten()
+                            .collect::<Vec<_>>();
+                        for (a, b) in product_pairs {
+                            match (op, a, b) {
+                                (_, MyType::Struct(_), _) => {
+                                    self.print();
+                                    todo!()
+                                }
+                                (_, _, MyType::Struct(_)) => {
+                                    self.print();
+                                    todo!()
+                                }
+                                (_, MyType::String, _) => {
+                                    self.print();
+                                    todo!()
+                                }
+
+                                (_, _, MyType::String) => {
+                                    self.print();
+                                    todo!()
+                                }
+                                (_, MyType::Int, MyType::Int) => {
+                                    self.varindex_types.entry(*lhs).or_default().insert(MyType::Int);
+                                }
+                                (_, _, MyType::Float) => {
+                                    self.varindex_types.entry(*lhs).or_default().insert(MyType::Float);
+                                }
+                                (_, MyType::Float, _) => {
+                                    self.varindex_types.entry(*lhs).or_default().insert(MyType::Float);
+                                }
+                            };
+                        }
+                    }
+                    RhsExpression::CompareOp(_, _, _) => {
+                        self.varindex_types.entry(*lhs).or_default().insert(MyType::Int);
+                    }
+                    RhsExpression::Subscript(_, _) => {
+                        self.print();
+                        todo!()
+                    }
+                },
+                MyStatement::Return(lhs) => {
+                    let types = self.varindex_types.get(lhs).cloned().unwrap_or_default();
+                    self.return_types.extend(types);
+                }
+                MyStatement::Jump(_) => {}
+            }
+        }
+    }
+
+    fn type_count(&self) -> usize {
+        self.varindex_types.iter().map(|s| s.1.len()).sum::<usize>() + self.varname_types.len() + self.return_types.len()
+    }
+
+    pub fn print(&self) {
+        for s in self.varindex_types.iter() {
+            println!("{:?} => {:?}", s.0, s.1);
         }
     }
 }

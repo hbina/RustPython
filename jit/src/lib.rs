@@ -1,6 +1,6 @@
 mod instructions;
 
-use crate::instructions::FunctionTranspiler;
+use crate::instructions::{FunctionTranspiler, TypeResolver};
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleError};
@@ -79,6 +79,10 @@ impl Jit {
         let mut transpiler = FunctionTranspiler::new(bytecode);
         transpiler.transpile();
         transpiler.print();
+        let statements = transpiler.get_all_instructions();
+        let mut type_resolver = TypeResolver::new(bytecode, args, statements);
+        let solved = type_resolver.solve();
+        type_resolver.print();
 
         let sig = {
             let mut compiler = FunctionCompiler::new(&mut builder, bytecode.varnames.len(), args, ret, entry_block);
