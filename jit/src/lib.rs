@@ -1,11 +1,17 @@
+mod frontend_c;
+mod frontend_cranelift;
 mod instructions;
+mod transpiler;
 
-use crate::instructions::{FunctionTranspiler, TypeResolver};
+use crate::frontend_c::FrontendC;
+use crate::transpiler::{FunctionIr, TranspileByteCodeToStatementObject, TypeMap, TypeResolver, stringify_code_object};
+use cranelift::codegen::isa::TargetFrontendConfig;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleError};
 use instructions::FunctionCompiler;
 use rustpython_compiler_core::bytecode;
+use std::cell::Ref;
 use std::{fmt, mem::ManuallyDrop};
 
 #[derive(Debug, thiserror::Error)]
@@ -50,76 +56,47 @@ impl Jit {
             module,
         }
     }
-
-    fn build_function<C: bytecode::Constant>(
-        &mut self,
-        bytecode: &bytecode::CodeObject<C>,
-        args: &[JitType],
-        ret: Option<JitType>,
-    ) -> Result<(FuncId, JitSig), JitCompileError> {
-        for arg in args {
-            self.ctx.func.signature.params.push(AbiParam::new(arg.to_cranelift()));
-        }
-
-        if ret.is_some() {
-            self.ctx.func.signature.returns.push(AbiParam::new(ret.clone().unwrap().to_cranelift()));
-        }
-
-        let id = self
-            .module
-            .declare_function(&format!("jit_{}", bytecode.obj_name.as_ref()), Linkage::Export, &self.ctx.func.signature)?;
-
-        let func_ref = self.module.declare_func_in_func(id, &mut self.ctx.func);
-
-        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
-        let entry_block = builder.create_block();
-        builder.append_block_params_for_function_params(entry_block);
-        builder.switch_to_block(entry_block);
-
-        let mut transpiler = FunctionTranspiler::new(bytecode);
-        transpiler.transpile();
-        transpiler.print();
-        let statements = transpiler.get_all_instructions();
-        let mut type_resolver = TypeResolver::new(bytecode, args, statements);
-        let solved = type_resolver.solve();
-        type_resolver.print();
-
-        let sig = {
-            let mut compiler = FunctionCompiler::new(&mut builder, bytecode.varnames.len(), args, ret, entry_block);
-
-            compiler.compile(func_ref, bytecode)?;
-
-            compiler.sig
-        };
-
-        builder.seal_all_blocks();
-        builder.finalize();
-
-        self.module.define_function(id, &mut self.ctx)?;
-
-        self.module.clear_context(&mut self.ctx);
-
-        Ok((id, sig))
-    }
 }
 
-pub fn compile<C: bytecode::Constant>(
-    bytecode: &bytecode::CodeObject<C>,
-    args: &[JitType],
-    ret: Option<JitType>,
-) -> Result<CompiledCode, JitCompileError> {
+pub fn compile<C: bytecode::Constant>(bytecode: &bytecode::CodeObject<C>, args: &[JitType], ret: Option<JitType>) -> Result<CompiledCode, JitCompileError> {
     let mut jit = Jit::new();
 
-    let (id, sig) = jit.build_function(bytecode, args, ret)?;
+    let statement_object = TranspileByteCodeToStatementObject::new(bytecode).transpile();
 
-    jit.module.finalize_definitions()?;
+    println!("============== BEGIN TRANSPILED BYTECODE ==============");
+    statement_object.print_transformation();
+    println!("============== END TRANSPILED BYTECODE ==============");
+    println!("============== BEGIN FLATTEN PRINT ==============");
+    statement_object.print_flatten();
+    println!("============== END FLATTEN PRINT ==============");
 
-    let code = jit.module.get_finalized_function(id);
-    Ok(CompiledCode {
-        sig,
-        code,
-        module: ManuallyDrop::new(jit.module),
-    })
+    let mut type_resolver = TypeResolver::new(bytecode, args, statement_object.clone());
+    type_resolver.solve();
+    type_resolver.print();
+
+    let type_map = type_resolver.build();
+
+    let mut frontend_c = FrontendC::new(type_map, statement_object);
+
+    frontend_c.transpile();
+
+    todo!()
+
+    // let function_ir = transpiler.build();
+    // let type_map = type_resolver.build();
+
+    // let func_name = format!("jit_{}", bytecode.obj_name.as_ref());
+
+    // let (id, sig) = jit.build_function(func_name, function_ir, type_map)?;
+
+    // jit.module.finalize_definitions()?;
+    //
+    // let code = jit.module.get_finalized_function(id);
+    // Ok(CompiledCode {
+    //     sig,
+    //     code,
+    //     module: ManuallyDrop::new(jit.module),
+    // })
 }
 
 pub struct CompiledCode {
@@ -337,15 +314,11 @@ impl<'a> ArgsBuilder<'a> {
     }
 
     pub fn into_args(self) -> Option<Args<'a>> {
-        self.values
-            .iter()
-            .map(|v| v.as_ref().map(AbiValue::to_libffi_arg))
-            .collect::<Option<_>>()
-            .map(|cif_args| Args {
-                _values: self.values,
-                cif_args,
-                code: self.code,
-            })
+        self.values.iter().map(|v| v.as_ref().map(AbiValue::to_libffi_arg)).collect::<Option<_>>().map(|cif_args| Args {
+            _values: self.values,
+            cif_args,
+            code: self.code,
+        })
     }
 }
 
