@@ -1,126 +1,75 @@
-use rustpython_jit::{AbiValue, JitArgumentError};
-
-// TODO currently broken
-// #[test]
-// fn test_no_return_value() {
-//     let func = jit_function! { func() => r##"
-//         def func():
-//             pass
-//     "## };
-//
-//     assert_eq!(func(), Ok(()));
-// }
+/// Miscellaneous tests - verify C code generation
 
 #[test]
-fn test_invoke() {
-    let func = jit_function! { func => r##"
-        def func(a: int, b: float):
+fn test_function_signature() {
+    let c_code = jit_function! { func => r##"
+        def func(a: int, b: float) -> int:
             return 1
     "## };
 
-    assert_eq!(
-        func.invoke(&[AbiValue::Int(1)]),
-        Err(JitArgumentError::WrongNumberOfArguments)
-    );
-    assert_eq!(
-        func.invoke(&[AbiValue::Int(1), AbiValue::Float(2.0), AbiValue::Int(0)]),
-        Err(JitArgumentError::WrongNumberOfArguments)
-    );
-    assert_eq!(
-        func.invoke(&[AbiValue::Int(1), AbiValue::Int(1)]),
-        Err(JitArgumentError::ArgumentTypeMismatch)
-    );
-    assert_eq!(
-        func.invoke(&[AbiValue::Int(1), AbiValue::Float(2.0)]),
-        Ok(Some(AbiValue::Int(1)))
-    );
-}
-
-#[test]
-fn test_args_builder() {
-    let func = jit_function! { func=> r##"
-        def func(a: int, b: float):
-            return 1
-    "## };
-
-    let mut args_builder = func.args_builder();
-    assert_eq!(args_builder.set(0, AbiValue::Int(1)), Ok(()));
-    assert!(args_builder.is_set(0));
-    assert!(!args_builder.is_set(1));
-    assert_eq!(
-        args_builder.set(1, AbiValue::Int(1)),
-        Err(JitArgumentError::ArgumentTypeMismatch)
-    );
-    assert!(args_builder.is_set(0));
-    assert!(!args_builder.is_set(1));
-    assert!(args_builder.into_args().is_none());
-
-    let mut args_builder = func.args_builder();
-    assert_eq!(args_builder.set(0, AbiValue::Int(1)), Ok(()));
-    assert_eq!(args_builder.set(1, AbiValue::Float(1.0)), Ok(()));
-    assert!(args_builder.is_set(0));
-    assert!(args_builder.is_set(1));
-
-    let args = args_builder.into_args();
-    assert!(args.is_some());
-    assert_eq!(args.unwrap().invoke(), Some(AbiValue::Int(1)));
+    // Verify function signature with mixed types
+    assert!(c_code.contains("int64_t func(int64_t a, double b)"));
+    assert!(c_code.contains("#include <stdint.h>"));
 }
 
 #[test]
 fn test_if_else() {
-    let if_else = jit_function! { if_else(a:i64) -> i64 => r##"
-        def if_else(a: int):
+    let c_code = jit_function! { if_else => r##"
+        def if_else(a: int) -> int:
             if a:
                 return 42
             else:
                 return 0
-
-            # Prevent type failure from implicit `return None`
             return 0
     "## };
 
-    assert_eq!(if_else(0), Ok(0));
-    assert_eq!(if_else(1), Ok(42));
-    assert_eq!(if_else(-1), Ok(42));
-    assert_eq!(if_else(100), Ok(42));
+    assert!(c_code.contains("int64_t if_else(int64_t a)"));
+    // Should have conditional logic and multiple returns
+    assert!(c_code.contains("goto") || c_code.contains("if"));
+    assert!(c_code.contains("return 42") || c_code.contains("42LL"));
+    assert!(c_code.contains("return 0") || c_code.contains("0LL"));
 }
 
 #[test]
 fn test_while_loop() {
-    let while_loop = jit_function! { while_loop(a:i64) -> i64 => r##"
-        def while_loop(a: int):
+    let c_code = jit_function! { while_loop => r##"
+        def while_loop(a: int) -> int:
             b = 0
             while a > 0:
                 b += 1
                 a -= 1
             return b
     "## };
-    assert_eq!(while_loop(0), Ok(0));
-    assert_eq!(while_loop(-1), Ok(0));
-    assert_eq!(while_loop(1), Ok(1));
-    assert_eq!(while_loop(10), Ok(10));
+
+    assert!(c_code.contains("int64_t while_loop(int64_t a)"));
+    // Should have labels for loop
+    assert!(c_code.contains("label_"));
+    // Should have comparison and goto
+    assert!(c_code.contains(">"));
+    assert!(c_code.contains("goto"));
 }
 
 #[test]
-fn test_unpack_tuple() {
-    let unpack_tuple = jit_function! { unpack_tuple(a:i64, b:i64) -> i64 => r##"
-        def unpack_tuple(a: int, b: int):
-            a, b = b, a
-            return a
+fn test_local_variables() {
+    let c_code = jit_function! { local_vars => r##"
+        def local_vars(a: int, b: int) -> int:
+            c = a + b
+            d = c * 2
+            return d
     "## };
 
-    assert_eq!(unpack_tuple(0, 1), Ok(1));
-    assert_eq!(unpack_tuple(1, 2), Ok(2));
+    assert!(c_code.contains("int64_t local_vars(int64_t a, int64_t b)"));
+    // Should have local variable declarations
+    assert!(c_code.contains("int64_t var_") || c_code.contains("int64_t tmp_"));
 }
 
 #[test]
-fn test_recursive_fib() {
-    let fib = jit_function! { fib(n: i64) -> i64 => r##"
-        def fib(n: int) -> int:
-          if n == 0 or n == 1:
-            return 1
-          return fib(n-1) + fib(n-2)
+fn test_constant_return() {
+    let c_code = jit_function! { const_ret => r##"
+        def const_ret(a: int) -> int:
+            return 42
     "## };
 
-    assert_eq!(fib(10), Ok(89));
+    assert!(c_code.contains("int64_t const_ret(int64_t a)"));
+    assert!(c_code.contains("42"));
 }

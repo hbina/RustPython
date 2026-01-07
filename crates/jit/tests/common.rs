@@ -2,7 +2,7 @@ use core::ops::ControlFlow;
 use rustpython_compiler_core::bytecode::{
     CodeObject, ConstantData, Instruction, OpArg, OpArgState,
 };
-use rustpython_jit::{CompiledCode, JitType};
+use rustpython_jit::JitType;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -12,7 +12,8 @@ pub struct Function {
 }
 
 impl Function {
-    pub fn compile(self) -> CompiledCode {
+    /// Compile the function to C code and return the generated source
+    pub fn compile(self) -> String {
         let mut arg_types = Vec::new();
         for arg in self.code.arg_names().args {
             let arg_type = match self.annotations.get(arg) {
@@ -188,6 +189,8 @@ impl StackMachine {
     }
 }
 
+/// Compile a Python function to C code and return the generated source
+#[macro_export]
 macro_rules! jit_function {
     ($func_name:ident => $($t:tt)*) => {
         {
@@ -199,34 +202,6 @@ macro_rules! jit_function {
             let mut machine = $crate::common::StackMachine::new();
             machine.run(code);
             machine.get_function(stringify!($func_name)).compile()
-        }
-    };
-    ($func_name:ident($($arg_name:ident:$arg_type:ty),*) -> $ret_type:ty => $($t:tt)*) => {
-        {
-            let jit_code = jit_function!($func_name => $($t)*);
-
-            move |$($arg_name:$arg_type),*| -> Result<$ret_type, rustpython_jit::JitArgumentError> {
-                jit_code
-                    .invoke(&[$($arg_name.into()),*])
-                    .map(|ret| match ret {
-                        Some(ret) => ret.try_into().expect("jit function returned unexpected type"),
-                        None => panic!("jit function unexpectedly returned None")
-                    })
-            }
-        }
-    };
-    ($func_name:ident($($arg_name:ident:$arg_type:ty),*) => $($t:tt)*) => {
-        {
-            let jit_code = jit_function!($func_name => $($t)*);
-
-            move |$($arg_name:$arg_type),*| -> Result<(), rustpython_jit::JitArgumentError> {
-                jit_code
-                    .invoke(&[$($arg_name.into()),*])
-                    .map(|ret| match ret {
-                        Some(ret) => panic!("jit function unexpectedly returned a value {:?}", ret),
-                        None => ()
-                    })
-            }
         }
     };
 }

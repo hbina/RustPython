@@ -5,8 +5,6 @@ use super::{
     PyAsyncGen, PyCode, PyCoroutine, PyDictRef, PyGenerator, PyStr, PyStrRef, PyTuple, PyTupleRef,
     PyType,
 };
-#[cfg(feature = "jit")]
-use crate::common::lock::OnceCell;
 use crate::common::lock::PyMutex;
 use crate::function::ArgMapping;
 use crate::object::{Traverse, TraverseFn};
@@ -22,8 +20,6 @@ use crate::{
     },
 };
 use itertools::Itertools;
-#[cfg(feature = "jit")]
-use rustpython_jit::CompiledCode;
 
 #[pyclass(module = false, name = "function", traverse = "manual")]
 #[derive(Debug)]
@@ -39,8 +35,6 @@ pub struct PyFunction {
     annotations: PyMutex<PyDictRef>,
     module: PyMutex<PyObjectRef>,
     doc: PyMutex<PyObjectRef>,
-    #[cfg(feature = "jit")]
-    jitted_code: OnceCell<CompiledCode>,
 }
 
 unsafe impl Traverse for PyFunction {
@@ -84,8 +78,6 @@ impl PyFunction {
             annotations: PyMutex::new(vm.ctx.new_dict()),
             module: PyMutex::new(module),
             doc: PyMutex::new(vm.ctx.none()),
-            #[cfg(feature = "jit")]
-            jitted_code: OnceCell::new(),
         };
         Ok(func)
     }
@@ -396,22 +388,6 @@ impl Py<PyFunction> {
         locals: Option<ArgMapping>,
         vm: &VirtualMachine,
     ) -> PyResult {
-        #[cfg(feature = "jit")]
-        if let Some(jitted_code) = self.jitted_code.get() {
-            use crate::convert::ToPyObject;
-            match jit::get_jit_args(self, &func_args, jitted_code, vm) {
-                Ok(args) => {
-                    return Ok(args.invoke().to_pyobject(vm));
-                }
-                Err(err) => info!(
-                    "jit: function `{}` is falling back to being interpreted because of the \
-                    error: {}",
-                    self.code.lock().obj_name,
-                    err
-                ),
-            }
-        }
-
         let code = self.code.lock().clone();
 
         let locals = if code.flags.contains(bytecode::CodeFlags::NEW_LOCALS) {
@@ -622,16 +598,13 @@ impl PyFunction {
 
     #[cfg(feature = "jit")]
     #[pymethod]
-    fn __jit__(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<()> {
-        zelf.jitted_code
-            .get_or_try_init(|| {
-                let arg_types = jit::get_jit_arg_types(&zelf, vm)?;
-                let ret_type = jit::jit_ret_type(&zelf, vm)?;
-                let code = zelf.code.lock();
-                rustpython_jit::compile(&code.code, &arg_types, ret_type)
-                    .map_err(|err| jit::new_jit_error(err.to_string(), vm))
-            })
-            .map(drop)
+    fn __jit__(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+        let arg_types = jit::get_jit_arg_types(&zelf, vm)?;
+        let ret_type = jit::jit_ret_type(&zelf, vm)?;
+        let code = zelf.code.lock();
+        let c_code = rustpython_jit::compile(&code.code, &arg_types, ret_type)
+            .map_err(|err| jit::new_jit_error(err.to_string(), vm))?;
+        Ok(vm.ctx.new_str(c_code))
     }
 }
 
